@@ -319,6 +319,12 @@ async function main() {
       bootStage("body", "ok", `${p.bodyCount} bodies, 85 meshes ready`);
       bootMaybeDismiss();
       physicsResolve(p);
+      // MANTIS_STAGE1: visual only; loaded after the original body is ready.
+      if (APP_MODE === "science") {
+        void import("./mantis-stage1").then(({ addMantis }) => {
+          addMantis(room, p);
+        }).catch(e => log("Mantis add-on: " + String(e), "warn"));
+      }
     })
     .catch((e) => {
       log(`flybody failed to load: ${(e as Error).message}`, "warn");
@@ -1300,6 +1306,120 @@ async function main() {
     policyActionStats.count = policyTickCount;
     return true;
   };
+
+
+  window.addEventListener("mantis-head-loss", (event) => {
+    const dead = (event as CustomEvent<boolean>).detail === true;
+    sim.setHeadLost(dead);
+    room.setMantisBodyDisabled(dead);
+
+    if (dead) {
+      resetVnc();
+      vncSim?.reset();
+      driveFwd = 0;
+      driveTurn = 0;
+      room.setDrive(0, 0);
+    }
+  });
+  // MANTIS_STAGE2_START: experimental visual-input adapter.
+  if (APP_MODE === "science") {
+    const panel = document.createElement("section");
+    panel.id = "mantis-brain-panel";
+    panel.style.cssText = "padding:10px;border:1px solid #536443;border-radius:5px;background:#101a15;flex-shrink:0";
+    panel.innerHTML = `<h2 style="margin:0 0 8px;font-size:12px;color:#bacd9b">MANTIS - BRAIN LINK</h2>
+      <button type="button" class="stim-btn">Connect brain</button>
+      <label style="display:block;margin-top:8px;font-size:12px;color:#bacd9b"><input type="checkbox" checked> Mantis input</label>
+      <p style="font-size:11px;color:#bacd9b;white-space:pre-line">Ready. Reset mantis, connect brain, then Approach.</p>
+      <small style="color:#8a958c">Experimental pixel mapping. Brain and scene clocks differ. Head-loss switch enabled. Nerve-cord damage is not modeled.</small>`;
+    document.querySelector("#side h1")?.after(panel);
+    const connect = panel.querySelector("button")!;
+    const input = panel.querySelector("input")!;
+    const status = panel.querySelector("p")!;
+    const sample = (xs: number[]) => {
+      const n = Math.min(4000, xs.length);
+      return Array.from({length:n}, (_, i) => xs[Math.floor(i*xs.length/n)]);
+    };
+    const left = sample(opticLeft), right = sample(opticRight);
+    const rest = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+    let running = false;
+    window.addEventListener("pagehide", () => { running = false; });
+    connect.onclick = async () => {
+      if (running) {
+        running = false; connect.disabled = true; connect.textContent = "Stopping...";
+        return;
+      }
+      if (busy) { status.textContent = "Let the current stimulus finish, or stop Track target first."; return; }
+      if (trainedActiveTargetCmS > 0) { status.textContent = "Turn off Use RL policy before connecting."; return; }
+      const mantis = room.scene.getObjectByName("Mantis_stage1_visual_only");
+      if (!mantis || !physics) { status.textContent = "Wait for the fly and mantis to load."; return; }
+      if (!left.length || !right.length) { status.textContent = "Optic neuron groups missing. Stop here."; return; }
+      const ext = new Float32Array(header.numNeurons);
+      const restoreLayers: (() => void)[] = [];
+      const disabledBefore = buttons.map(b => b.disabled);
+      running = true; busy = true;
+      connect.textContent = "Disconnect brain";
+      buttons.forEach(b => { b.disabled = true; });
+      let modelMs = 0;
+      try {
+        mantis.traverse(object => {
+          const mask = object.layers.mask;
+          restoreLayers.push(() => { object.layers.mask = mask; });
+          object.layers.enable(0);
+        });
+        sim.reset(); resetVnc(); vncSim?.reset();
+        playing = false; viewer.setAutoplay(false); viewer.clearSnapshots();
+        controls.hidden = true;
+        driveFwd = 0; driveTurn = 0; room.setDrive(0, 0);
+        await rest(150);
+        while (running) {
+          if (document.hidden) { await rest(100); continue; }
+          const { pixels, w, h } = room.retinaFrame();
+          let seen = 0, onLeft = 0;
+          // Detect our green model; this is not a biological vision model.
+          for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+            const k = (y*w+x)*4, r = pixels[k], g = pixels[k+1], b = pixels[k+2];
+            if (g > 12 && g > r*1.15 && g > b*1.3) {
+              seen++; if (x < w/2) onLeft++;
+            }
+          }
+          const amp = !sim.headLost && input.checked && seen ? Math.min(4, 1.5+12*seen/(w*h)) : 0;
+          ext.fill(0);
+          if (amp > 0) {
+            const share = onLeft/seen;
+            for (const i of left) ext[i] = amp*(0.3+0.7*share);
+            for (const i of right) ext[i] = amp*(0.3+0.7*(1-share));
+          }
+          sim.setExternalInput(ext);
+          const rate = await sim.captureRollingRate(20);
+          modelMs += 20*sim.params.dtMs;
+          if (!running) break;
+          viewer.clearSnapshots(); viewer.pushSnapshot(rate);
+          // Preserve the existing brain-to-body path; do not force escape.
+          await applyDriveFromSnapshot(rate);
+          let active = 0;
+          for (const value of rate) if (value > 0) active++;
+          status.textContent = `Green pixels: ${seen}/${w*h}\nInput: ${amp > 0 ? "ON" : "OFF"}\nActive model neurons: ${active.toLocaleString()}\nBrain time: ${modelMs.toFixed(0)} ms`;
+          await rest(100);
+        }
+        status.textContent = "Disconnected. Latest computed brain activity is held on screen.";
+      } catch (error) {
+        status.textContent = "Brain-link error: " + String(error);
+        log(status.textContent, "warn");
+      } finally {
+        try { sim.setExternalInput(ext.fill(0)); } catch { /* GPU may be lost. */ }
+        restoreLayers.forEach(restore => restore());
+        driveFwd = 0; driveTurn = 0; room.setDrive(0, 0);
+        buttons.forEach((b, i) => { b.disabled = disabledBefore[i]; });
+        playing = false; viewer.setAutoplay(false); playBtn.textContent = "\u25b6";
+        scrub.max = String(Math.max(0, viewer.numSnapshots-1)); scrub.value = "0";
+        label.textContent = `Latest activity | brain time ${modelMs.toFixed(0)} ms`;
+        controls.hidden = false;
+        running = false; busy = false;
+        connect.disabled = false; connect.textContent = "Connect brain";
+      }
+    };
+  }
+  // MANTIS_STAGE2_END
 
   // --- Click-to-stim: pulse a single neuron, watch the cascade ---
   async function runSingleNeuronStim(idx: number) {

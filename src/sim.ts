@@ -9,7 +9,7 @@ import { SimParams, DEFAULT_PARAMS, assertValidDt } from "./simParams";
 export { DEFAULT_PARAMS, assertValidDt } from "./simParams";
 export type { SimParams } from "./simParams";
 
-const PARAMS_BYTES = 36; // matches struct Params in lif.wgsl (9 × 4 bytes)
+const PARAMS_BYTES = 48; // includes head-loss flag at byte 36
 
 export class FlySim {
   readonly device: GPUDevice;
@@ -39,6 +39,14 @@ export class FlySim {
   private accumBindA!: GPUBindGroup; // accumulate reads spikesA
   private accumBindB!: GPUBindGroup; // accumulate reads spikesB
 
+  // MANTIS_HEAD_LOSS_V1: experimental all-or-none brain switch.
+  private headLost_ = false;
+  get headLost() { return this.headLost_; }
+  setHeadLost(value: boolean) {
+    const restoring = this.headLost_ && !value;
+    this.headLost_ = value;
+    if (restoring) this.reset();
+  }
   private step_ = 0;
   private prevIsA_ = true;
 
@@ -247,6 +255,7 @@ export class FlySim {
     dv.setFloat32(24, this.params.extGain, true);
     dv.setUint32(28, this.step_, true);
     dv.setFloat32(32, this.params.wSyn, true);
+    dv.setUint32(36, this.headLost_ ? 1 : 0, true);
     this.device.queue.writeBuffer(this.paramsBuf, 0, ab);
   }
 

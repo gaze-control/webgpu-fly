@@ -25,6 +25,7 @@ struct Params {
   ext_gain         : f32,
   step             : u32,
   w_syn            : f32,   // calibrated for alpha synapse: ~0.022 mV
+  head_lost : u32,
 };
 
 @group(0) @binding(0) var<uniform>             params      : Params;
@@ -57,6 +58,14 @@ fn spike_bit(idx : u32) -> f32 {
 fn step_lif(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= params.num_neurons) { return; }
+  // clear_spikes has already zeroed this step's output.
+  if (params.head_lost != 0u) {
+    vm[i] = params.v_rest;
+    refrac[i] = 0u;
+    g_x[i] = 0.0;
+    g_y[i] = 0.0;
+    return;
+  }
 
   // 1. Synaptic gather over incoming edges. weight[k] is the pre-signed
   // synapse count from build_csr.py.

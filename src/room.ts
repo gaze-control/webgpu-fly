@@ -96,6 +96,19 @@ export class Room {
   private forward = 0;
   private turn = 0;
 
+  // MANTIS_BODY_SHUTDOWN_V1
+  private mantisBodyDisabled = false;
+
+  setMantisBodyDisabled(value: boolean) {
+    this.mantisBodyDisabled = value;
+    if (value && this.physics) {
+      this.forward = 0;
+      this.turn = 0;
+      this.physics.driveLegs(0, 0);
+      this.physics.driveWings(0, 0);
+    }
+  }
+
   /** Frame hook installed by main.ts when the trained walker is active. Returns true when it consumed the physics budget. */
   drivePolicyTick?: () => boolean;
 
@@ -176,11 +189,21 @@ export class Room {
     this.buildBodyGraphFromMujoco(physics);
   }
 
-  setDrive(forward: number, turn: number) { this.forward = forward; this.turn = turn; }
+  setDrive(forward: number, turn: number) {
+    if (this.mantisBodyDisabled) {
+      this.forward = 0;
+      this.turn = 0;
+      return;
+    }
+    this.forward = forward;
+    this.turn = turn;
+  }
   resetFly() { this.physics?.reset(); }
   bodySpeed(): number { return this.physics?.bodySpeed ?? 0; }
   /** Triggers DNp01 escape-jump: instantaneous upward impulse. */
-  jumpImpulse(speed: number) { this.physics?.jumpImpulse(speed); }
+  jumpImpulse(speed: number) {
+    if (!this.mantisBodyDisabled) this.physics?.jumpImpulse(speed);
+  }
 
   /**
    * Sensor read for closed-loop control. Returns the signed horizontal
@@ -648,11 +671,17 @@ export class Room {
           // Brain → VNC stand-in → body. Two motor primitives selected
           // by DN drive: tripod walk gait (amplitude = forward) and
           // wing-buzz hover (amplitude = remaining drive after walking).
-          const sign = this.forward < 0 ? -1 : 1;
-          const walkAmp = sign * Math.min(1, Math.sqrt(Math.abs(this.forward)));
-          this.physics.driveLegs(walkAmp, this.turn);
-          const buzz = Math.min(1, Math.abs(this.forward) * 0.5 + Math.abs(this.turn) * 0.3);
-          this.physics.driveWings(buzz, this.turn);
+          if (this.mantisBodyDisabled) {
+            // Brain may still be stepping, but active body drive is gone.
+            this.physics.driveLegs(0, 0);
+            this.physics.driveWings(0, 0);
+          } else {
+            const sign = this.forward < 0 ? -1 : 1;
+            const walkAmp = sign * Math.min(1, Math.sqrt(Math.abs(this.forward)));
+            this.physics.driveLegs(walkAmp, this.turn);
+            const buzz = Math.min(1, Math.abs(this.forward) * 0.5 + Math.abs(this.turn) * 0.3);
+            this.physics.driveWings(buzz, this.turn);
+          }
           // flybody MJCF runs at dt=0.0001 s; cap sim per render frame
           // to keep frame budget sane. 32 substeps ≈ 3.2 ms simulated
           // per render.
